@@ -1,0 +1,1 @@
+"""CapCut Windows launcher package."""
