@@ -30,11 +30,6 @@ def get_proxy_from_environment() -> ProxyConfig | None:
 
 
 def check_tcp_endpoint(proxy: ProxyConfig, timeout: float = 5.0) -> None:
-    """Check that the configured proxy endpoint is reachable.
-
-    This is deliberately a TCP reachability check, not a claim that CapCut
-    will use the proxy for every request.
-    """
     with socket.create_connection((proxy.host, proxy.port), timeout=timeout):
         return
 
@@ -42,7 +37,8 @@ def check_tcp_endpoint(proxy: ProxyConfig, timeout: float = 5.0) -> None:
 def capcut_environment(proxy: ProxyConfig | None) -> dict[str, str]:
     env = os.environ.copy()
     if proxy:
-        # Standard variables are inherited only by the CapCut process.
+        # These variables are inherited by CapCut's process only; Windows' global
+        # proxy configuration is not changed by this function.
         env["HTTP_PROXY"] = proxy.url
         env["HTTPS_PROXY"] = proxy.url
         env["ALL_PROXY"] = proxy.url
