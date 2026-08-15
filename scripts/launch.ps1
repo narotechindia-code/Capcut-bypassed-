@@ -1,5 +1,6 @@
 $ErrorActionPreference = 'Stop'
 $script:ExitCode = 0
+$script:TempWarp = $null
 
 function Show-LauncherError {
     param([object]$ErrorRecord)
@@ -18,13 +19,9 @@ function Find-CapCutExe {
         (Join-Path $env:PROGRAMFILES 'CapCut\Apps\CapCut.exe'),
         (Join-Path ${env:PROGRAMFILES(X86)} 'CapCut\Apps\CapCut.exe')
     )
-
     foreach ($candidate in $candidates) {
-        if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
-            return (Resolve-Path -LiteralPath $candidate).Path
-        }
+        if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) { return (Resolve-Path -LiteralPath $candidate).Path }
     }
-
     foreach ($root in @($env:LOCALAPPDATA, $env:PROGRAMFILES, ${env:PROGRAMFILES(X86)}) | Where-Object { $_ -and (Test-Path $_) }) {
         try {
             $hit = Get-ChildItem -LiteralPath $root -Filter 'CapCut.exe' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -34,81 +31,163 @@ function Find-CapCutExe {
     return $null
 }
 
+function Find-WarpCli {
+    $cmd = Get-Command warp-cli.exe -ErrorAction SilentlyContinue
+    if (-not $cmd) { $cmd = Get-Command warp-cli -ErrorAction SilentlyContinue }
+    if ($cmd) { return $cmd.Source }
+    foreach ($p in @(
+        (Join-Path $env:PROGRAMFILES 'Cloudflare\Cloudflare WARP\warp-cli.exe'),
+        (Join-Path $env:PROGRAMFILES 'Cloudflare\Cloudflare One Client\warp-cli.exe'),
+        (Join-Path ${env:PROGRAMFILES(X86)} 'Cloudflare\Cloudflare WARP\warp-cli.exe')
+    )) { if ($p -and (Test-Path -LiteralPath $p -PathType Leaf)) { return $p } }
+    return $null
+}
+
+function Run-Warp {
+    param([string[]]$Args, [int]$TimeoutSec = 60)
+    $cli = Find-WarpCli
+    if (-not $cli) { throw 'warp-cli.exe was not found.' }
+    $output = & $cli @Args 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "warp-cli $($Args -join ' ') failed (code $LASTEXITCODE): $($output.Trim())" }
+    return $output
+}
+
+function Ensure-WarpInstalled {
+    $cli = Find-WarpCli
+    if ($cli) { return $cli }
+    $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if (-not $winget) { $winget = Get-Command winget -ErrorAction SilentlyContinue }
+    if (-not $winget) { throw 'Cloudflare WARP is required for the temporary installation VPN, but winget is not available.' }
+    Write-Host '       Installing Cloudflare WARP...' -ForegroundColor Cyan
+    & $winget.Source install --id Cloudflare.Warp --exact --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+    if ($LASTEXITCODE -ne 0) { throw "Cloudflare WARP installation failed (code $LASTEXITCODE)." }
+    for ($i=0; $i -lt 20; $i++) {
+        $cli = Find-WarpCli
+        if ($cli) { return $cli }
+        Start-Sleep -Seconds 1
+    }
+    throw 'Cloudflare WARP installed but warp-cli.exe could not be found.'
+}
+
+function Start-TemporaryFullWarp {
+    $cli = Ensure-WarpInstalled
+    $status = (Run-Warp @('status')).ToLowerInvariant()
+    $settings = (Run-Warp @('settings')).ToLowerInvariant()
+    $wasConnected = ($status -match 'connected' -and $status -notmatch 'disconnected')
+    $oldMode = 'warp'
+    if ($settings -match 'warpproxy|local proxy|proxy') { $oldMode = 'proxy' }
+
+    if (-not $wasConnected) {
+        try { Run-Warp @('registration','show') | Out-Null } catch { Run-Warp @('registration','new') | Out-Null }
+        Write-Host '       Enabling temporary full-device WARP...' -ForegroundColor Cyan
+        Run-Warp @('mode','warp') | Out-Null
+        Run-Warp @('connect') | Out-Null
+        $connectedByUs = $true
+    } else {
+        Write-Host '       WARP is already connected; using the existing WARP tunnel for installation.' -ForegroundColor DarkGray
+        $connectedByUs = $false
+    }
+
+    for ($i=0; $i -lt 30; $i++) {
+        $s = (Run-Warp @('status')).ToLowerInvariant()
+        if ($s -match 'connected' -and $s -notmatch 'disconnected') {
+            return [pscustomobject]@{ Cli=$cli; ConnectedByUs=$connectedByUs; PreviousMode=$oldMode }
+        }
+        Start-Sleep -Seconds 1
+    }
+    throw 'Cloudflare WARP did not reach Connected state.'
+}
+
+function Stop-TemporaryFullWarp {
+    param($Session)
+    if (-not $Session -or -not $Session.ConnectedByUs) { return }
+    try {
+        Write-Host '       Turning temporary installation VPN OFF...' -ForegroundColor Cyan
+        Run-Warp @('disconnect') | Out-Null
+        if ($Session.PreviousMode -eq 'proxy') { Run-Warp @('mode','proxy') | Out-Null }
+        else { Run-Warp @('mode','warp') | Out-Null }
+    } catch { Write-Host "       WARNING: Could not fully restore WARP state: $($_.Exception.Message)" -ForegroundColor Yellow }
+}
+
 function Test-TrustedCapCutInstaller {
     param([Parameter(Mandatory=$true)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
     $sig = Get-AuthenticodeSignature -LiteralPath $Path
     if ($sig.Status -ne 'Valid') { return $false }
-    $subject = [string]$sig.SignerCertificate.Subject
-    return ($subject -match '(?i)ByteDance')
+    return ([string]$sig.SignerCertificate.Subject -match '(?i)ByteDance')
 }
 
-function Download-OfficialCapCutInstaller {
+function Download-CapCutInstallerThroughOfficialEndpoint {
     param([Parameter(Mandatory=$true)][string]$Destination)
-
-    # This is CapCut's own US package CDN, not a mirror. The pinned build is
-    # used only as an installation fallback because CapCut does not expose a
-    # stable documented direct-installer API. The installer is signature-checked
-    # before it is executed. If the CDN removes this build, fail safely rather
-    # than downloading an unknown third-party executable.
-    $url = 'https://lf16-capcut.faceulv.com/obj/capcutpc-packages-us/packages/CapCut_7_5_0_3053_capcutpc_0_creatortool.exe'
-
-    Write-Host '       Trying CapCut official package CDN...' -ForegroundColor Cyan
+    $url = 'https://www.capcut.com/activity/download_pc?__position__=top'
+    Write-Host '       Downloading from CapCut official Windows download endpoint...' -ForegroundColor Cyan
     try {
-        Invoke-WebRequest -Uri $url -OutFile $Destination -UseBasicParsing
+        Invoke-WebRequest -Uri $url -OutFile $Destination -MaximumRedirection 10 -UseBasicParsing -Headers @{ 'User-Agent'='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150 Safari/537.36' }
     } catch {
-        throw "Could not download the CapCut installer from the official package CDN: $($_.Exception.Message)"
+        throw "CapCut official download endpoint could not be fetched even with WARP: $($_.Exception.Message)"
     }
 
+    if (-not (Test-Path -LiteralPath $Destination -PathType Leaf)) { throw 'CapCut download endpoint did not produce a file.' }
+    $item = Get-Item -LiteralPath $Destination
+    if ($item.Length -lt 1MB) {
+        Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        throw 'CapCut returned a web page/redirect instead of the Windows installer. A browser session may be required to resolve the download URL.'
+    }
+    $bytes = [System.IO.File]::ReadAllBytes($Destination)
+    if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+        Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        throw 'CapCut returned non-EXE content instead of the Windows installer.'
+    }
     if (-not (Test-TrustedCapCutInstaller -Path $Destination)) {
         Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
         throw 'The downloaded CapCut installer failed the Windows Authenticode/ByteDance signature check. It was NOT executed.'
     }
-
     return $Destination
 }
 
 function Install-CapCut {
     param([Parameter(Mandatory=$true)][string]$DownloadDir)
-
     $installer = Join-Path $DownloadDir 'CapCut_Setup.exe'
 
-    # First try the Microsoft Store package. This is official, but Windows may
-    # reject it in regions where CapCut is unavailable.
+    # The Microsoft Store route is attempted first, but it is expected to be
+    # unavailable in some regions.
     $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
     if (-not $winget) { $winget = Get-Command winget -ErrorAction SilentlyContinue }
     if ($winget) {
         Write-Host '       Trying the official Microsoft Store package...' -ForegroundColor Cyan
         & $winget.Source install --id XP9KN75RRB9NHS --exact --source msstore --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
-        $code = $LASTEXITCODE
         Start-Sleep -Seconds 3
         $found = Find-CapCutExe
         if ($found) { return $found }
-        Write-Host "       Microsoft Store installation was not available/successful (code $code)." -ForegroundColor Yellow
+        Write-Host '       Store installation was unavailable or did not install CapCut.' -ForegroundColor Yellow
     }
 
-    # Fall back to CapCut's own package CDN. This is the important path for
-    # machines where the India-region website/store does not expose CapCut.
-    Download-OfficialCapCutInstaller -Destination $installer | Out-Null
-    Write-Host '       Official CapCut installer downloaded and signature verified.' -ForegroundColor Green
-    Write-Host '       Starting CapCut installer...' -ForegroundColor Cyan
-
-    $process = Start-Process -FilePath $installer -Wait -PassThru
-    Write-Host "       Installer process exited with code $($process.ExitCode)." -ForegroundColor DarkGray
-
-    $deadline = (Get-Date).AddMinutes(10)
-    while ((Get-Date) -lt $deadline) {
-        $found = Find-CapCutExe
-        if ($found) { return $found }
-        Start-Sleep -Seconds 2
+    # IMPORTANT: this is the user's requested behavior. Full-device WARP is
+    # enabled only for the installer download/install phase, then disconnected.
+    $script:TempWarp = Start-TemporaryFullWarp
+    try {
+        Download-CapCutInstallerThroughOfficialEndpoint -Destination $installer | Out-Null
+        Write-Host '       Official CapCut installer downloaded and signature verified.' -ForegroundColor Green
+        Write-Host '       Starting CapCut installer...' -ForegroundColor Cyan
+        $process = Start-Process -FilePath $installer -Wait -PassThru
+        Write-Host "       Installer process exited with code $($process.ExitCode)." -ForegroundColor DarkGray
+        $deadline = (Get-Date).AddMinutes(15)
+        while ((Get-Date) -lt $deadline) {
+            $found = Find-CapCutExe
+            if ($found) { return $found }
+            Start-Sleep -Seconds 2
+        }
+        throw 'CapCut installer finished, but CapCut.exe was not detected.'
     }
-
-    throw 'The official CapCut installer finished, but CapCut.exe was not detected. The installation may have been blocked or may require a restart.'
+    finally {
+        Stop-TemporaryFullWarp $script:TempWarp
+        $script:TempWarp = $null
+    }
 }
 
 try {
     Write-Host '=== CapCut Windows Launcher ===' -ForegroundColor Cyan
-    Write-Host 'Bootstrap mode: repaired automatic-install flow' -ForegroundColor DarkGray
+    Write-Host 'Bootstrap mode: temporary VPN installation flow' -ForegroundColor DarkGray
     if ($env:OS -ne 'Windows_NT') { throw 'This launcher supports Windows only.' }
 
     $repo = 'narotechindia-code/Capcut-bypassed-'
@@ -122,10 +201,7 @@ try {
     function Find-Python {
         foreach ($command in @('py', 'python')) {
             if (Get-Command $command -ErrorAction SilentlyContinue) {
-                try {
-                    & $command -c "import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)" 2>$null
-                    if ($LASTEXITCODE -eq 0) { return $command }
-                } catch {}
+                try { & $command -c "import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)" 2>$null; if ($LASTEXITCODE -eq 0) { return $command } } catch {}
             }
         }
         return $null
@@ -142,13 +218,10 @@ try {
         Write-Host '       CapCut is not installed.' -ForegroundColor Yellow
         $capcutExe = Install-CapCut -DownloadDir $downloadDir
     }
-
     Write-Host "       CapCut ready: $capcutExe" -ForegroundColor Green
     $env:CAPCUT_EXE = $capcutExe
 
     Write-Host '[3/5] Downloading launcher files...' -ForegroundColor Cyan
-    $launcherDir = Join-Path $installRoot 'launcher'
-    New-Item -ItemType Directory -Force -Path $launcherDir | Out-Null
     foreach ($file in @('launcher/__init__.py','launcher/main.py','launcher/capcut.py','launcher/network.py','launcher/vpn.py','requirements.txt')) {
         $target = Join-Path $installRoot $file
         New-Item -ItemType Directory -Force -Path (Split-Path $target) | Out-Null
@@ -170,6 +243,7 @@ try {
 }
 catch {
     $script:ExitCode = 1
+    if ($script:TempWarp) { Stop-TemporaryFullWarp $script:TempWarp; $script:TempWarp = $null }
     Show-LauncherError $_
 }
 finally {
