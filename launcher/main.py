@@ -4,9 +4,16 @@ import argparse
 import os
 import platform
 
-from .capcut import find_capcut, launch_capcut
-from .network import capcut_environment, check_tcp_endpoint, get_proxy_from_environment
-from .vpn import start_warp_proxy, stop_warp_proxy, warp_status
+# Support both normal package execution (`python -m launcher.main`) and the
+# bootstrapper's direct-file execution (`python ...\launcher\main.py`).
+try:
+    from .capcut import find_capcut, launch_capcut
+    from .network import capcut_environment, check_tcp_endpoint, get_proxy_from_environment
+    from .vpn import start_warp_proxy, stop_warp_proxy, warp_status
+except ImportError:
+    from capcut import find_capcut, launch_capcut
+    from network import capcut_environment, check_tcp_endpoint, get_proxy_from_environment
+    from vpn import start_warp_proxy, stop_warp_proxy, warp_status
 
 
 def parse_args() -> argparse.Namespace:
