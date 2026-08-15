@@ -57,8 +57,17 @@ try {
         $target = Join-Path $installRoot $file
         New-Item -ItemType Directory -Force -Path (Split-Path $target) | Out-Null
         Invoke-WebRequest -Uri "$rawBase/$file" -OutFile $target
+        if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
+            throw "Failed to download required file: $file"
+        }
     }
     Write-Host '       Download complete.' -ForegroundColor Green
+
+    $mainPy = Join-Path $installRoot 'launcher\main.py'
+    $initPy = Join-Path $installRoot 'launcher\__init__.py'
+    if (-not (Test-Path -LiteralPath $mainPy -PathType Leaf) -or -not (Test-Path -LiteralPath $initPy -PathType Leaf)) {
+        throw "Launcher package is incomplete. Expected files under: $launcherDir"
+    }
 
     Write-Host '[3/5] Preparing isolated Python environment...' -ForegroundColor Cyan
     if (-not (Test-Path (Join-Path $venv 'Scripts/python.exe'))) {
@@ -72,23 +81,19 @@ try {
     Write-Host '       Python environment ready.' -ForegroundColor Green
 
     Write-Host '[4/5] Starting launcher...' -ForegroundColor Cyan
-    # python -m resolves packages from the current working directory. The user may
-    # be running this script from C:\Windows\System32, so explicitly expose the
-    # downloaded application root through PYTHONPATH.
-    $oldPythonPath = $env:PYTHONPATH
-    if ([string]::IsNullOrWhiteSpace($oldPythonPath)) {
-        $env:PYTHONPATH = $installRoot
-    } else {
-        $env:PYTHONPATH = "$installRoot;$oldPythonPath"
+    Write-Host "       Application root: $installRoot" -ForegroundColor DarkGray
+    Write-Host "       Python: $venvPython" -ForegroundColor DarkGray
+
+    # The bootstrapper can be launched from C:\Windows\System32 (or anywhere else).
+    # Run from the downloaded application root so Python's normal module discovery
+    # finds the launcher package without relying on the caller's working directory.
+    Push-Location -LiteralPath $installRoot
+    try {
+        & $venvPython -m launcher.main
+        $script:ExitCode = $LASTEXITCODE
     }
-
-    & $venvPython -m launcher.main
-    $script:ExitCode = $LASTEXITCODE
-
-    if ($null -eq $oldPythonPath) {
-        Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
-    } else {
-        $env:PYTHONPATH = $oldPythonPath
+    finally {
+        Pop-Location
     }
 
     Write-Host '[5/5] Launcher finished.' -ForegroundColor Green
