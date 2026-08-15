@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -12,12 +13,25 @@ COMMON_PATHS = [
     Path(os.environ.get("LOCALAPPDATA", "")) / "CapCut" / "CapCut.exe",
     Path(os.environ.get("PROGRAMFILES", "")) / "CapCut" / "Apps" / "CapCut.exe",
     Path(os.environ.get("PROGRAMFILES(X86)", "")) / "CapCut" / "Apps" / "CapCut.exe",
+    Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "CapCut" / "CapCut.exe",
 ]
 
 
+def _candidate_roots() -> list[Path]:
+    roots = []
+    for value in (
+        os.environ.get("LOCALAPPDATA"),
+        os.environ.get("PROGRAMFILES"),
+        os.environ.get("PROGRAMFILES(X86)"),
+    ):
+        if value:
+            roots.append(Path(value))
+    return roots
+
+
 def find_capcut(explicit: Optional[str] = None) -> Optional[Path]:
-    """Find a CapCut executable without modifying the machine."""
-    candidates = []
+    """Find an installed CapCut executable without modifying the machine."""
+    candidates: list[Path] = []
     if explicit:
         candidates.append(Path(explicit).expanduser())
 
@@ -27,15 +41,41 @@ def find_capcut(explicit: Optional[str] = None) -> Optional[Path]:
 
     candidates.extend(COMMON_PATHS)
 
-    # Search only likely CapCut directories; avoid an expensive whole-disk scan.
-    roots = [
-        Path(os.environ.get("LOCALAPPDATA", "")),
-        Path(os.environ.get("PROGRAMFILES", "")),
-        Path(os.environ.get("PROGRAMFILES(X86)", "")),
-    ]
-    for root in roots:
-        if root.exists():
-            candidates.extend(root.glob("CapCut*/**/CapCut.exe"))
+    # CapCut versions can place the executable below a versioned directory.
+    # Keep the search bounded to the standard application roots.
+    for root in _candidate_roots():
+        if not root.exists():
+            continue
+        for pattern in (
+            "CapCut*/**/CapCut.exe",
+            "CapCut/**/CapCut.exe",
+            "Programs/CapCut/**/CapCut.exe",
+        ):
+            try:
+                candidates.extend(root.glob(pattern))
+            except (OSError, ValueError):
+                pass
+
+    # Also inspect the uninstall registry indirectly through PowerShell. This
+    # catches installations registered by an installer in a non-standard folder.
+    ps = shutil.which("powershell.exe")
+    if ps:
+        command = r"Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like '*CapCut*' } | Select-Object -ExpandProperty InstallLocation"
+        try:
+            result = subprocess.run(
+                [ps, "-NoProfile", "-NonInteractive", "-Command", command],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            for line in result.stdout.splitlines():
+                location = line.strip()
+                if location:
+                    candidates.append(Path(location) / "CapCut.exe")
+                    candidates.extend(Path(location).glob("**/CapCut.exe"))
+        except (OSError, subprocess.SubprocessError):
+            pass
 
     seen = set()
     for candidate in candidates:
