@@ -18,6 +18,9 @@ try {
 
     $repo = 'narotechindia-code/Capcut-bypassed-'
     $rawBase = "https://raw.githubusercontent.com/$repo/main"
+    # Raw GitHub responses can be cached. Use a unique query value for every
+    # dependency download so an older launcher file can never be reused here.
+    $cacheBust = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds().ToString()
     $installRoot = Join-Path $env:LOCALAPPDATA 'CapCutBypassedLauncher'
     $venv = Join-Path $installRoot '.venv'
     New-Item -ItemType Directory -Force -Path $installRoot | Out-Null
@@ -52,7 +55,8 @@ try {
     foreach ($file in $files) {
         $target = Join-Path $installRoot $file
         New-Item -ItemType Directory -Force -Path (Split-Path $target) | Out-Null
-        Invoke-WebRequest -Uri "$rawBase/$file" -OutFile $target
+        $uri = "$rawBase/$file?v=$cacheBust"
+        Invoke-WebRequest -Uri $uri -OutFile $target -Headers @{ 'Cache-Control' = 'no-cache'; 'Pragma' = 'no-cache' }
         if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { throw "Failed to download required file: $file" }
     }
     Write-Host '       Download complete.' -ForegroundColor Green
