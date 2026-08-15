@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import os
 import platform
+import shutil
+import subprocess
+import time
+from pathlib import Path
 
-# Support both normal package execution (`python -m launcher.main`) and the
-# bootstrapper's direct-file execution (`python ...\launcher\main.py`).
 try:
     from .capcut import find_capcut, launch_capcut
     from .network import capcut_environment, check_tcp_endpoint, get_proxy_from_environment
@@ -14,6 +16,8 @@ except ImportError:
     from capcut import find_capcut, launch_capcut
     from network import capcut_environment, check_tcp_endpoint, get_proxy_from_environment
     from vpn import start_warp_proxy, stop_warp_proxy, warp_status
+
+CAPCUT_WINGET_ID = "ByteDance.CapCut"
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,7 +30,73 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Detect and validate without launching CapCut")
     parser.add_argument("--no-proxy-check", action="store_true", help="Skip local proxy TCP reachability test")
     parser.add_argument("--warp-status", action="store_true", help="Print WARP status and exit")
+    parser.add_argument("--no-install", action="store_true", help="Do not automatically install CapCut when missing")
     return parser.parse_args()
+
+
+def _run_command(args: list[str], timeout: int = 180) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+
+def install_capcut() -> Path | None:
+    """Install the current CapCut package through Windows Package Manager.
+
+    The package is published as ByteDance.CapCut and WinGet obtains the
+    installer from the package source rather than bundling a stale installer
+    in this repository.
+    """
+    existing = find_capcut()
+    if existing:
+        return existing
+
+    winget = shutil.which("winget.exe") or shutil.which("winget")
+    if not winget:
+        raise RuntimeError(
+            "Windows Package Manager (winget) is not available. "
+            "Install/update Microsoft's App Installer, then rerun the launcher."
+        )
+
+    print("CapCut is not installed. Installing the official CapCut package through WinGet...")
+    result = _run_command(
+        [
+            winget,
+            "install",
+            "--id",
+            CAPCUT_WINGET_ID,
+            "--exact",
+            "--source",
+            "winget",
+            "--silent",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+            "--disable-interactivity",
+        ],
+        timeout=600,
+    )
+
+    output = "\n".join(part for part in (result.stdout, result.stderr) if part).strip()
+    if result.returncode not in (0, 0x8A150014):
+        detail = output[-1800:] if output else "No installer output was returned."
+        raise RuntimeError(f"CapCut installation failed (WinGet exit code {result.returncode}).\n{detail}")
+
+    print("CapCut installation command completed. Detecting the installed executable...")
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        executable = find_capcut()
+        if executable:
+            return executable
+        time.sleep(2)
+
+    raise RuntimeError(
+        "WinGet reported that CapCut was installed, but CapCut.exe could not be detected yet. "
+        "Try running the launcher again."
+    )
 
 
 def main() -> int:
@@ -40,6 +110,13 @@ def main() -> int:
         return 0
 
     executable = find_capcut(args.capcut or os.environ.get("CAPCUT_EXE"))
+    if executable is None and not args.no_install and not args.capcut and not os.environ.get("CAPCUT_EXE"):
+        try:
+            executable = install_capcut()
+        except Exception as exc:
+            print(f"ERROR: {exc}")
+            return 11
+
     if executable is None:
         print("CapCut was not found on this PC.")
         print("Install the official Windows CapCut application, then rerun this launcher.")
