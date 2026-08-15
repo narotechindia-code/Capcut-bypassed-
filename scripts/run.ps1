@@ -72,8 +72,24 @@ try {
     Write-Host '       Python environment ready.' -ForegroundColor Green
 
     Write-Host '[4/5] Starting launcher...' -ForegroundColor Cyan
+    # python -m resolves packages from the current working directory. The user may
+    # be running this script from C:\Windows\System32, so explicitly expose the
+    # downloaded application root through PYTHONPATH.
+    $oldPythonPath = $env:PYTHONPATH
+    if ([string]::IsNullOrWhiteSpace($oldPythonPath)) {
+        $env:PYTHONPATH = $installRoot
+    } else {
+        $env:PYTHONPATH = "$installRoot;$oldPythonPath"
+    }
+
     & $venvPython -m launcher.main
     $script:ExitCode = $LASTEXITCODE
+
+    if ($null -eq $oldPythonPath) {
+        Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+    } else {
+        $env:PYTHONPATH = $oldPythonPath
+    }
 
     Write-Host '[5/5] Launcher finished.' -ForegroundColor Green
     if ($script:ExitCode -ne 0) {
