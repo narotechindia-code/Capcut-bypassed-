@@ -10,6 +10,43 @@ function Show-LauncherError {
     Write-Host 'The PowerShell window will remain open so you can read the error.' -ForegroundColor Yellow
 }
 
+function Find-CapCutExe {
+    $candidates = @(
+        (Join-Path $env:LOCALAPPDATA 'CapCut\Apps\CapCut.exe'),
+        (Join-Path $env:LOCALAPPDATA 'CapCut\CapCut.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\CapCut\CapCut.exe'),
+        (Join-Path $env:PROGRAMFILES 'CapCut\Apps\CapCut.exe'),
+        (Join-Path ${env:PROGRAMFILES(X86)} 'CapCut\Apps\CapCut.exe')
+    )
+
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) { return (Resolve-Path -LiteralPath $candidate).Path }
+    }
+
+    foreach ($root in @($env:LOCALAPPDATA, $env:PROGRAMFILES, ${env:PROGRAMFILES(X86)}) | Where-Object { $_ -and (Test-Path $_) }) {
+        try {
+            $hit = Get-ChildItem -LiteralPath $root -Filter 'CapCut.exe' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($hit) { return $hit.FullName }
+        } catch {}
+    }
+
+    try {
+        $locations = @(
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        )
+        foreach ($item in Get-ItemProperty $locations -ErrorAction SilentlyContinue) {
+            if ($item.DisplayName -like '*CapCut*' -and $item.InstallLocation) {
+                $hit = Get-ChildItem -LiteralPath $item.InstallLocation -Filter 'CapCut.exe' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($hit) { return $hit.FullName }
+            }
+        }
+    } catch {}
+
+    return $null
+}
+
 try {
     Write-Host '=== CapCut Windows Launcher ===' -ForegroundColor Cyan
     Write-Host 'Bootstrap mode: safe / non-closing' -ForegroundColor DarkGray
@@ -18,8 +55,6 @@ try {
 
     $repo = 'narotechindia-code/Capcut-bypassed-'
     $rawBase = "https://raw.githubusercontent.com/$repo/main"
-    # Raw GitHub responses can be cached. Use a unique query value for every
-    # dependency download so an older launcher file can never be reused here.
     $cacheBust = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds().ToString()
     $installRoot = Join-Path $env:LOCALAPPDATA 'CapCutBypassedLauncher'
     $venv = Join-Path $installRoot '.venv'
@@ -48,18 +83,56 @@ try {
     }
     Write-Host "       Found: $python" -ForegroundColor Green
 
-    Write-Host '[2/5] Downloading launcher files...' -ForegroundColor Cyan
+    Write-Host '[2/5] Preparing CapCut and launcher files...' -ForegroundColor Cyan
+
+    # Install CapCut here, in the PowerShell bootstrap itself. This guarantees
+    # installation happens even if an older cached Python launcher is returned.
+    $capcutExe = Find-CapCutExe
+    if (-not $capcutExe) {
+        $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+        if (-not $winget) { $winget = Get-Command winget -ErrorAction SilentlyContinue }
+        if (-not $winget) {
+            throw "CapCut is not installed and Windows Package Manager (winget) is unavailable. Install/update Microsoft's App Installer, then rerun the launcher."
+        }
+
+        Write-Host '       CapCut is not installed.' -ForegroundColor Yellow
+        Write-Host '       Installing the official CapCut package through WinGet...' -ForegroundColor Cyan
+        & $winget.Source install --id ByteDance.CapCut --exact --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+        $wingetCode = $LASTEXITCODE
+        if ($wingetCode -ne 0 -and $wingetCode -ne 0x8A150014) {
+            throw "CapCut installation failed. WinGet exit code: $wingetCode"
+        }
+
+        Write-Host '       Waiting for CapCut installation to become visible...' -ForegroundColor Cyan
+        $deadline = (Get-Date).AddSeconds(120)
+        while ((Get-Date) -lt $deadline) {
+            $capcutExe = Find-CapCutExe
+            if ($capcutExe) { break }
+            Start-Sleep -Seconds 2
+        }
+        if (-not $capcutExe) {
+            throw 'WinGet completed, but CapCut.exe could not be located. The installer may require a restart or a user-session refresh.'
+        }
+        Write-Host "       CapCut installed: $capcutExe" -ForegroundColor Green
+    }
+    else {
+        Write-Host "       CapCut already installed: $capcutExe" -ForegroundColor Green
+    }
+
+    # Pass the detected executable to Python so even older detector code can
+    # launch the exact installation found by this bootstrapper.
+    $env:CAPCUT_EXE = $capcutExe
+
     $launcherDir = Join-Path $installRoot 'launcher'
     New-Item -ItemType Directory -Force -Path $launcherDir | Out-Null
     $files = @('launcher/__init__.py', 'launcher/main.py', 'launcher/capcut.py', 'launcher/network.py', 'launcher/vpn.py', 'requirements.txt')
     foreach ($file in $files) {
         $target = Join-Path $installRoot $file
         New-Item -ItemType Directory -Force -Path (Split-Path $target) | Out-Null
-        $uri = "$rawBase/$file?v=$cacheBust"
-        Invoke-WebRequest -Uri $uri -OutFile $target -Headers @{ 'Cache-Control' = 'no-cache'; 'Pragma' = 'no-cache' }
+        Invoke-WebRequest -Uri "$rawBase/$file?v=$cacheBust" -OutFile $target -Headers @{ 'Cache-Control' = 'no-cache'; 'Pragma' = 'no-cache' }
         if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { throw "Failed to download required file: $file" }
     }
-    Write-Host '       Download complete.' -ForegroundColor Green
+    Write-Host '       Launcher files ready.' -ForegroundColor Green
 
     $mainPy = Join-Path $installRoot 'launcher\main.py'
     $initPy = Join-Path $installRoot 'launcher\__init__.py'
@@ -78,9 +151,8 @@ try {
     Write-Host '[4/5] Starting launcher...' -ForegroundColor Cyan
     Write-Host "       Application root: $installRoot" -ForegroundColor DarkGray
     Write-Host "       Python: $venvPython" -ForegroundColor DarkGray
+    Write-Host "       CapCut: $env:CAPCUT_EXE" -ForegroundColor DarkGray
 
-    # Execute the downloaded file directly. This removes Python package discovery
-    # from the bootstrap path completely and works regardless of the caller's cwd.
     & $venvPython $mainPy
     $script:ExitCode = $LASTEXITCODE
 
