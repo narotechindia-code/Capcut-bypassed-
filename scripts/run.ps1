@@ -84,17 +84,18 @@ try {
     Write-Host "       Application root: $installRoot" -ForegroundColor DarkGray
     Write-Host "       Python: $venvPython" -ForegroundColor DarkGray
 
-    # The bootstrapper can be launched from C:\Windows\System32 (or anywhere else).
-    # Run from the downloaded application root so Python's normal module discovery
-    # finds the launcher package without relying on the caller's working directory.
-    Push-Location -LiteralPath $installRoot
-    try {
-        & $venvPython -m launcher.main
-        $script:ExitCode = $LASTEXITCODE
-    }
-    finally {
-        Pop-Location
-    }
+    # Do not depend on the caller's working directory or PYTHONPATH. Import the
+    # downloaded package from an explicit absolute path inside Python itself.
+    $bootstrapCode = @"
+import sys
+from pathlib import Path
+root = Path(r'''$installRoot''')
+sys.path.insert(0, str(root))
+import launcher.main
+raise SystemExit(launcher.main.main())
+"@
+    & $venvPython -c $bootstrapCode
+    $script:ExitCode = $LASTEXITCODE
 
     Write-Host '[5/5] Launcher finished.' -ForegroundColor Green
     if ($script:ExitCode -ne 0) {
