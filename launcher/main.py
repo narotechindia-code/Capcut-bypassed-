@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import os
 import platform
-import sys
 
 from .capcut import find_capcut, launch_capcut
 from .network import capcut_environment, check_tcp_endpoint, get_proxy_from_environment
@@ -13,8 +12,10 @@ from .vpn import start_warp_proxy, stop_warp_proxy, warp_status
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Windows CapCut launcher")
     parser.add_argument("--capcut", help="Explicit path to CapCut.exe")
-    parser.add_argument("--mode", choices=("auto", "warp", "proxy", "direct"), default="auto",
-                        help="auto=prefer WARP, warp=Cloudflare WARP, proxy=CAPCUT_PROXY, direct=no special route")
+    parser.add_argument(
+        "--mode", choices=("auto", "warp", "proxy", "direct"), default="auto",
+        help="auto=try WARP then configured proxy; warp=Cloudflare WARP; proxy=CAPCUT_PROXY; direct=normal network",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Detect and validate without launching CapCut")
     parser.add_argument("--no-proxy-check", action="store_true", help="Skip local proxy TCP reachability test")
     parser.add_argument("--warp-status", action="store_true", help="Print WARP status and exit")
@@ -31,8 +32,7 @@ def main() -> int:
         print(warp_status())
         return 0
 
-    explicit = args.capcut or os.environ.get("CAPCUT_EXE")
-    executable = find_capcut(explicit)
+    executable = find_capcut(args.capcut or os.environ.get("CAPCUT_EXE"))
     if executable is None:
         print("CapCut was not found on this PC.")
         print("Install the official Windows CapCut application, then rerun this launcher.")
@@ -41,52 +41,47 @@ def main() -> int:
 
     print(f"CapCut: {executable}")
     session = None
-    proxy = None
+    proxy_config = None
 
     try:
         configured_proxy = get_proxy_from_environment()
-        mode = args.mode
 
-        if mode in ("auto", "warp"):
+        if args.mode in ("auto", "warp"):
             try:
                 print("Network mode: Cloudflare WARP local proxy")
                 session = start_warp_proxy()
-                proxy = session.proxy_url
-                print(f"WARP proxy: {proxy}")
+                os.environ["CAPCUT_PROXY"] = session.proxy_url
+                proxy_config = get_proxy_from_environment()
+                print(f"CapCut proxy: {session.proxy_url}")
             except Exception as exc:
-                if mode == "warp":
+                if args.mode == "warp":
                     print(f"ERROR: WARP mode could not be started: {exc}")
                     return 20
-                print(f"WARP unavailable; falling back to configured proxy/direct mode: {exc}")
+                print(f"WARP unavailable: {exc}")
 
-        if session is None and mode in ("auto", "proxy"):
+        if session is None and args.mode in ("auto", "proxy"):
             if configured_proxy:
-                proxy = configured_proxy.url
-                print(f"Network mode: configured proxy ({configured_proxy.scheme})")
-                if not args.no_proxy_check:
-                    check_tcp_endpoint(configured_proxy)
-            elif mode == "proxy":
+                proxy_config = configured_proxy
+                print(f"Network mode: configured {configured_proxy.scheme.upper()} proxy")
+            elif args.mode == "proxy":
                 print("ERROR: --mode proxy requires CAPCUT_PROXY.")
                 return 21
-            else:
-                print("Network mode: direct (no proxy configured).")
+            elif args.mode == "auto":
+                print("ERROR: No working WARP or configured proxy is available.")
+                print("Refusing to launch directly because the purpose of this launcher is the CapCut network route.")
+                return 22
+
+        if args.mode == "direct":
+            proxy_config = None
+            print("Network mode: direct Windows connection")
+
+        if proxy_config and not args.no_proxy_check:
+            check_tcp_endpoint(proxy_config)
+            print("Proxy endpoint: reachable")
 
         if args.dry_run:
             print("Dry run successful.")
             return 0
-
-        # Convert the selected URL back into the normal ProxyConfig parser path.
-        selected = os.environ.get("CAPCUT_PROXY", "")
-        if session is not None:
-            os.environ["CAPCUT_PROXY"] = session.proxy_url
-            proxy_config = get_proxy_from_environment()
-        elif proxy:
-            proxy_config = get_proxy_from_environment()
-        else:
-            proxy_config = None
-
-        if proxy_config and not args.no_proxy_check:
-            check_tcp_endpoint(proxy_config)
 
         code = launch_capcut(executable, capcut_environment(proxy_config))
         print(f"CapCut exited with code {code}.")
