@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import base64
 import csv
+import html
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,12 +50,23 @@ def _run(args: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]
     )
 
 
-def _download(url: str, destination: Path, timeout: int = 120) -> None:
-    req = urllib.request.Request(url, headers={"User-Agent": "CapCutBypassedLauncher/2.2"})
+def _request(url: str, timeout: int = 60) -> bytes:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "CapCutBypassedLauncher/2.4",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+    )
     with urllib.request.urlopen(req, timeout=timeout) as response:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with destination.open("wb") as output:
-            shutil.copyfileobj(response, output)
+        return response.read()
+
+
+def _download(url: str, destination: Path, timeout: int = 120) -> None:
+    data = _request(url, timeout=timeout)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(data)
 
 
 def find_openvpn() -> str | None:
@@ -79,11 +93,10 @@ def install_openvpn() -> str:
         msi_name = f"OpenVPN-{OPENVPN_VERSION}-{OPENVPN_RELEASE}-x86.msi"
     else:
         msi_name = f"OpenVPN-{OPENVPN_VERSION}-{OPENVPN_RELEASE}-amd64.msi"
-    url = f"https://swupdate.openvpn.org/community/releases/{msi_name}"
     msi = Path(tempfile.gettempdir()) / msi_name
     print(f"OpenVPN Community is not installed. Downloading official OpenVPN {OPENVPN_VERSION}...", flush=True)
     try:
-        _download(url, msi, timeout=180)
+        _download(f"https://swupdate.openvpn.org/community/releases/{msi_name}", msi, timeout=180)
     except Exception as exc:
         raise RuntimeError(f"Could not download the official OpenVPN installer: {exc}") from exc
     print("Installing OpenVPN silently (Administrator privileges are already active)...", flush=True)
@@ -115,12 +128,15 @@ def install_split_tunnel_helper() -> Path:
     if redirector:
         return redirector
     api_url = f"https://api.github.com/repos/{SPLIT_TUNNEL_REPO}/releases/latest"
-    req = urllib.request.Request(api_url, headers={"User-Agent": "CapCutBypassedLauncher/2.2"})
-    with urllib.request.urlopen(req, timeout=30) as response:
-        release = json.loads(response.read().decode("utf-8"))
-    installer = next((asset for asset in release.get("assets", [])
-                      if str(asset.get("name", "")).lower().startswith("vpnclientsetup-")
-                      and str(asset.get("name", "")).lower().endswith(".exe")), None)
+    response = json.loads(_request(api_url, timeout=30).decode("utf-8"))
+    installer = next(
+        (
+            asset for asset in response.get("assets", [])
+            if str(asset.get("name", "")).lower().startswith("vpnclientsetup-")
+            and str(asset.get("name", "")).lower().endswith(".exe")
+        ),
+        None,
+    )
     if not installer or not installer.get("browser_download_url"):
         raise RuntimeError("Could not find the split-tunnel helper installer in its latest GitHub release.")
     temp = Path(tempfile.gettempdir()) / str(installer["name"])
@@ -144,68 +160,103 @@ def install_split_tunnel_helper() -> Path:
     raise RuntimeError("Split-tunnel helper installed, but redirector.exe was not found.")
 
 
-def _fetch_vpngate_text() -> str:
-    last_error: Exception | None = None
-    for attempt in range(1, 6):
-        try:
-            req = urllib.request.Request(VPN_GATE_API, headers={
-                "User-Agent": "CapCutBypassedLauncher/2.2",
-                "Cache-Control": "no-cache",
-                "Pragma": "no-cache",
-            })
-            with urllib.request.urlopen(req, timeout=30) as response:
-                text = response.read().decode("utf-8", errors="replace")
-            if "#HostName,IP," in text and "OpenVPN_ConfigData_Base64" in text:
-                return text
-            last_error = RuntimeError("VPN Gate API response was incomplete.")
-        except Exception as exc:
-            last_error = exc
-        if attempt < 5:
-            time.sleep(attempt * 2)
-    raise RuntimeError(f"Could not retrieve a complete live VPN Gate server list: {last_error}")
-
-
-def _vpngate_row() -> dict[str, str]:
-    text = _fetch_vpngate_text()
-    lines = [line for line in text.splitlines() if line.strip() and not line.startswith("*")]
+def _parse_csv_rows(text: str) -> list[dict[str, str]]:
+    lines = [line for line in text.splitlines() if line.strip()]
     header_index = next((i for i, line in enumerate(lines) if line.startswith("#HostName,")), None)
     if header_index is None:
-        raise RuntimeError("VPN Gate API did not return the expected CSV header.")
-    header = lines[header_index].lstrip("#")
-    records = lines[header_index + 1:]
-    rows = list(csv.DictReader(records, fieldnames=header.split(",")))
-    wanted = VPN_GATE_HOST.lower().rstrip(".")
-    wanted_short = wanted.removesuffix(".opengw.net")
+        return []
+    reader = csv.DictReader(lines[header_index:], restval="")
+    return list(reader)
 
-    for row in rows:
-        host = (row.get("HostName") or "").strip().lower().rstrip(".")
-        ip = (row.get("IP") or "").strip()
-        if host in {wanted, wanted_short} and (row.get("OpenVPN_ConfigData_Base64") or "").strip():
-            current_ip = ip or "unknown"
-            if current_ip != VPN_GATE_EXPECTED_IP:
-                print(
-                    f"VPN Gate server IP changed: screenshot={VPN_GATE_EXPECTED_IP}, live={current_ip}. Using hostname {VPN_GATE_HOST}.",
-                    flush=True,
-                )
-            return row
 
-    # As a second check, the hostname may still resolve while the API row is temporarily absent.
+def _find_row_in_api() -> dict[str, str] | None:
+    for _ in range(5):
+        try:
+            text = _request(VPN_GATE_API, timeout=30).decode("utf-8", errors="replace")
+            rows = _parse_csv_rows(text)
+            wanted = VPN_GATE_HOST.lower().rstrip(".")
+            for row in rows:
+                host = (row.get("HostName") or "").strip().lower().rstrip(".")
+                if host == wanted and (row.get("OpenVPN_ConfigData_Base64") or "").strip():
+                    return row
+        except Exception:
+            pass
+        time.sleep(2)
+    return None
+
+
+def _find_do_openvpn_link() -> str | None:
+    """Fallback when the CSV API is blocked/empty: use the live VPN Gate server page."""
     try:
-        resolved = socket.gethostbyname(VPN_GATE_HOST)
+        ip = socket.gethostbyname(VPN_GATE_HOST)
     except OSError:
-        resolved = ""
-    raise RuntimeError(
-        f"VPN Gate could not provide an OpenVPN profile for {VPN_GATE_HOST}:{VPN_GATE_TCP_PORT}. "
-        f"Current DNS={resolved or 'unresolved'}. The server may be temporarily missing from the API; retrying later may succeed."
-    )
+        ip = VPN_GATE_EXPECTED_IP
+
+    # VPN Gate exposes a do_openvpn.aspx page for individual servers. Its query
+    # parameters do not require the CSV API session ID; the page contains the
+    # current openvpn_download.aspx link including the required sid/hid values.
+    query = urllib.parse.urlencode({
+        "fqdn": VPN_GATE_HOST,
+        "ip": ip,
+        "tcp": str(VPN_GATE_TCP_PORT),
+        "udp": "0",
+    })
+    urls = [
+        f"https://www.vpngate.net/en/do_openvpn.aspx?{query}",
+        f"http://www.vpngate.net/en/do_openvpn.aspx?{query}",
+    ]
+    for url in urls:
+        try:
+            page = _request(url, timeout=30).decode("utf-8", errors="replace")
+            # Prefer a TCP OpenVPN download link for the requested port.
+            for match in re.finditer(r"(?:href|action)=[\"']([^\"']*openvpn_download\.aspx[^\"']*)[\"']", page, flags=re.IGNORECASE):
+                href = html.unescape(match.group(1)).replace("&amp;", "&")
+                if "tcp=1" not in href.lower():
+                    continue
+                if "port=" in href.lower() and f"port={VPN_GATE_TCP_PORT}" not in href.lower():
+                    continue
+                return urllib.parse.urljoin(url, href)
+        except Exception:
+            continue
+    return None
+
+
+def _download_profile_from_link(link: str) -> str:
+    content = _request(link, timeout=60).decode("utf-8", errors="replace")
+    if "client" not in content.lower() or "<ca>" not in content.lower():
+        raise RuntimeError("VPN Gate returned an invalid OpenVPN profile.")
+    return content
+
+
+def _vpngate_row() -> dict[str, str] | None:
+    row = _find_row_in_api()
+    if row:
+        live_ip = (row.get("IP") or "unknown").strip()
+        if live_ip != VPN_GATE_EXPECTED_IP:
+            print(f"VPN Gate server IP changed: screenshot={VPN_GATE_EXPECTED_IP}, live={live_ip}.", flush=True)
+        return row
+    return None
 
 
 def _write_vpngate_profile(runtime_dir: Path) -> Path:
     row = _vpngate_row()
-    try:
-        config = base64.b64decode(row["OpenVPN_ConfigData_Base64"]).decode("utf-8")
-    except Exception as exc:
-        raise RuntimeError(f"Could not decode the VPN Gate OpenVPN profile: {exc}") from exc
+    config: str | None = None
+
+    if row:
+        try:
+            config = base64.b64decode(row["OpenVPN_ConfigData_Base64"]).decode("utf-8")
+        except Exception:
+            config = None
+
+    if config is None:
+        print("VPN Gate CSV API is unavailable; switching to direct server-page profile retrieval...", flush=True)
+        link = _find_do_openvpn_link()
+        if not link:
+            raise RuntimeError(
+                f"VPN Gate could not provide an OpenVPN profile for {VPN_GATE_HOST}:{VPN_GATE_TCP_PORT}. "
+                "The server is visible in current VPN Gate listings, but its direct configuration page could not be retrieved."
+            )
+        config = _download_profile_from_link(link)
 
     lines = []
     for line in config.splitlines():
@@ -268,14 +319,27 @@ def start_split_vpn(capcut_exe: Path) -> SplitVpnSession:
         pass
     log_file = runtime_dir / "openvpn.log"
 
-    redirector_proc = subprocess.Popen([str(redirector), "observe"], cwd=str(redirector.parent), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    redirector_proc = subprocess.Popen(
+        [str(redirector), "observe"],
+        cwd=str(redirector.parent),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
     time.sleep(2)
-    openvpn_proc = subprocess.Popen([
-        openvpn, "--config", str(profile), "--auth-user-pass", str(auth_file),
-        "--pull-filter", "ignore", "redirect-gateway",
-        "--pull-filter", "ignore", "block-outside-dns",
-        "--log", str(log_file), "--verb", "3",
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    openvpn_proc = subprocess.Popen(
+        [
+            openvpn,
+            "--config", str(profile),
+            "--auth-user-pass", str(auth_file),
+            "--pull-filter", "ignore", "redirect-gateway",
+            "--pull-filter", "ignore", "block-outside-dns",
+            "--log", str(log_file), "--verb", "3",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
 
     session = SplitVpnSession(openvpn, openvpn_proc, redirector_proc, profile, auth_file, config_file)
     try:
@@ -288,13 +352,15 @@ def start_split_vpn(capcut_exe: Path) -> SplitVpnSession:
                     log_tail = log_file.read_text(encoding="utf-8", errors="replace")[-3000:]
             except OSError:
                 pass
-            raise RuntimeError(f"OpenVPN exited unexpectedly with code {openvpn_proc.returncode}.\nOpenVPN log: {log_file}\n{log_tail}")
+            raise RuntimeError(
+                f"OpenVPN exited unexpectedly with code {openvpn_proc.returncode}.\n"
+                f"OpenVPN log: {log_file}\n{log_tail}"
+            )
         session.connected = True
-        live_ip = "unknown"
         try:
             live_ip = socket.gethostbyname(VPN_GATE_HOST)
         except OSError:
-            pass
+            live_ip = "unknown"
         print(f"VPN: {VPN_GATE_HOST}:{VPN_GATE_TCP_PORT} (live DNS {live_ip})", flush=True)
         print("Split tunnel: CapCut.exe only; Windows default routing is left unchanged.", flush=True)
         return session
