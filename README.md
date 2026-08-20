@@ -1,17 +1,25 @@
-# CapCut Windows Launcher
+# CapCut Windows Process-Only VPN Launcher
 
-Windows-only launcher for running CapCut through a selected network path. The project now includes **Cloudflare WARP local-proxy mode**, a custom proxy mode, and direct mode.
+Windows launcher for running CapCut through a selected VPN path without intentionally changing Windows' normal/default route for other applications.
 
-## Modes
+## Network mode
 
-| Mode | Command | Effect |
-|---|---|---|
-| Auto | `--mode auto` | Try WARP first, then `CAPCUT_PROXY`; fail closed if neither works |
-| WARP | `--mode warp` | Install/use Cloudflare WARP and route CapCut through its local SOCKS5 proxy |
-| Proxy | `--mode proxy` | Use `CAPCUT_PROXY` only |
-| Direct | `--mode direct` | Launch CapCut normally without a special route |
+The default mode uses the **VPN Gate Vietnam server shown in the project configuration**:
 
-Cloudflare documents WARP Local Proxy as a desktop mode where only applications configured to use the HTTPS/SOCKS5 proxy are sent through WARP; other traffic remains on the normal Internet connection. WARP is not a country-spoofing service and does not promise a different country IP. See the official documentation: https://developers.cloudflare.com/warp-client/warp-modes/ .
+- Host: `vpn242832503.opengw.net`
+- IP: `42.112.191.8`
+- OpenVPN TCP: `1653`
+- VPN Gate public credentials: username `vpn`, password `vpn`
+
+The launcher downloads the live OpenVPN profile at runtime so the server's certificates/keys are not hard-coded in this repository.
+
+The launcher uses the open-source `ENA526/OpenVPN-Split-Tunneling` helper for the process-only part. Its redirector uses WinDivert and sends selected applications through the OpenVPN adapter while leaving unselected applications on the normal Windows route. The helper requires administrator privileges. citehttps://github.com/ENA526/OpenVPN-Split-Tunneling
+
+## Important limitation
+
+A normal OpenVPN client is system-wide at the adapter/routing layer. Merely setting `route-nopull` does **not** make OpenVPN process-only. The split-tunnel redirector is therefore required for the requested CapCut-only behavior.
+
+The helper currently redirects IPv4 traffic only. If CapCut uses IPv6, that traffic can remain on the normal connection.
 
 ## One-command PowerShell
 
@@ -19,62 +27,45 @@ Cloudflare documents WARP Local Proxy as a desktop mode where only applications 
 irm https://raw.githubusercontent.com/narotechindia-code/Capcut-bypassed-/main/scripts/run.ps1 | iex
 ```
 
-Explicit WARP mode:
+The bootstrapper:
 
-```powershell
-irm https://raw.githubusercontent.com/narotechindia-code/Capcut-bypassed-/main/scripts/run.ps1 | iex --mode warp
-```
+1. Detects Python 3.10+.
+2. If Python is missing, installs Python 3.12 automatically through the Python Software Foundation package in WinGet.
+3. Downloads the launcher files into `%LOCALAPPDATA%\CapCutBypassedLauncher`.
+4. Creates an isolated Python virtual environment.
+5. Automatically installs the CapCut process-only split-tunnel helper if it is missing.
+6. Downloads the live VPN Gate OpenVPN profile for the configured Vietnam server.
+7. Starts OpenVPN with the default-route redirect disabled.
+8. Starts the process-only redirector with only `CapCut.exe` admitted to the tunnel.
+9. Launches CapCut.
+10. Cleans up the OpenVPN/redirector processes when CapCut exits.
 
-**PowerShell note:** for reliable argument passing with a remote script, use:
+The launcher requests administrator elevation because the split-tunnel redirector needs to load its Windows packet-diversion driver.
 
-```powershell
-$script = irm https://raw.githubusercontent.com/narotechindia-code/Capcut-bypassed-/main/scripts/run.ps1
-& ([scriptblock]::Create($script)) -Mode warp
-```
+## Modes
 
-Custom proxy:
+- `--mode auto` — default; VPN Gate process-only tunnel, fail closed if unavailable.
+- `--mode vpn` — same as auto, explicitly.
+- `--mode direct` — launch CapCut without the VPN.
+- `--dry-run` — validate setup without launching CapCut.
+- `--vpn-status` — show the split-tunnel helper's VPN adapter status.
+- `--capcut "C:\path\to\CapCut.exe"` — use an explicit CapCut executable.
 
-```powershell
-$env:CAPCUT_PROXY = 'http://127.0.0.1:7890'
-$script = irm https://raw.githubusercontent.com/narotechindia-code/Capcut-bypassed-/main/scripts/run.ps1
-& ([scriptblock]::Create($script)) -Mode proxy
-```
+## Reliability choices
 
-WARP status:
-
-```powershell
-$script = irm https://raw.githubusercontent.com/narotechindia-code/Capcut-bypassed-/main/scripts/run.ps1
-& ([scriptblock]::Create($script)) -WarpStatus
-```
-
-## WARP behavior
-
-The launcher uses `warp-cli` and WARP local-proxy mode rather than enabling WARP's full-device tunnel. The selected SOCKS5 listener is passed to CapCut as process environment variables, so the launcher does not intentionally change Windows' global proxy settings.
-
-The launcher can install WARP through WinGet when the `Cloudflare.Warp` package is available. If WARP is already installed, it reuses the existing client. First-time WARP registration may require the normal Cloudflare client registration flow.
-
-## Important limitation
-
-CapCut can use networking components that ignore standard proxy environment variables. Therefore **process-scoped proxying is not a mathematical guarantee that every CapCut network request uses WARP**. This repository does not use an invasive packet interceptor or modify CapCut's executable. A true kernel-level per-process VPN would require a dedicated process-aware networking driver/client.
-
-## Safety / reliability choices
-
-- No hard-coded VPN credentials.
-- No random public VPN server list.
-- No CapCut executable patching.
-- Auto mode fails closed instead of silently launching CapCut directly when its special network route is unavailable.
-- Existing WARP is not intentionally disconnected unless this launcher created the connection.
-- The launcher only passes proxy variables to the CapCut child process.
-
-## CapCut installation
-
-If CapCut is not installed, the launcher reports that clearly instead of downloading an unverified executable. The official CapCut site provides the current Windows installer and Microsoft Store route: https://www.capcut.com/resource/capcut-for-windows .
+- No Cloudflare WARP dependency.
+- No hard-coded VPN certificates or private keys.
+- No Windows global proxy setting changes.
+- OpenVPN's pushed `redirect-gateway` is ignored.
+- The process-only helper is used instead of pretending ordinary OpenVPN routing is per-application.
+- The launcher fails closed when the requested VPN path cannot be established.
+- CapCut is installed only through the official `ByteDance.CapCut` WinGet package if it is missing.
 
 ## Project layout
 
-- `launcher/main.py` — modes, lifecycle, fail-closed behavior
-- `launcher/capcut.py` — CapCut discovery and process handling
-- `launcher/network.py` — process-scoped proxy environment
-- `launcher/vpn.py` — WARP installation, registration, local proxy, connection and cleanup
-- `scripts/run.ps1` — PowerShell bootstrapper
-- `requirements.txt` — Python dependencies
+- `launcher/main.py` — CLI, UAC elevation, CapCut lifecycle
+- `launcher/capcut.py` — CapCut discovery/launch
+- `launcher/network.py` — retained proxy parsing utilities
+- `launcher/vpn.py` — VPN Gate profile retrieval, OpenVPN lifecycle, split-tunnel helper setup
+- `scripts/run.ps1` — Python/bootstrapper
+- `requirements.txt` — standard-library-only Python runtime
