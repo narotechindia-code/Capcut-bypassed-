@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 $script:ExitCode = 0
-$LauncherVersion = '2.4.0'
-$CommitHint = 'd206c38'
+$LauncherVersion = '2.5.0'
+$CommitHint = '54480cd'
 
 function Show-LauncherError {
     param([object]$ErrorRecord)
