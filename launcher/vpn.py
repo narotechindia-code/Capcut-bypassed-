@@ -19,7 +19,7 @@ from pathlib import Path
 
 VPN_GATE_API = "https://www.vpngate.net/api/iphone/"
 VPN_GATE_HOST = "vpn242832503.opengw.net"
-VPN_GATE_EXPECTED_IP = "118.68.53.211"  # screenshot value; may change over time
+VPN_GATE_EXPECTED_IP = "118.68.53.211"
 VPN_GATE_TCP_PORT = 1653
 VPN_GATE_USERNAME = "vpn"
 VPN_GATE_PASSWORD = "vpn"
@@ -27,6 +27,11 @@ SPLIT_TUNNEL_REPO = "ENA526/OpenVPN-Split-Tunneling"
 SPLIT_TUNNEL_INSTALL_ROOT = Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "VpnClient"
 OPENVPN_VERSION = "2.7.6"
 OPENVPN_RELEASE = "I001"
+VPN_GATE_MIRRORS = (
+    "https://www.vpngate.net",
+    "https://vpngate.4d.workers.dev",
+    "https://sstp.mehdi-hoore.workers.dev",
+)
 
 
 @dataclass
@@ -54,7 +59,7 @@ def _request(url: str, timeout: int = 60) -> bytes:
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "CapCutBypassedLauncher/2.4",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CapCutBypassedLauncher/2.5",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
         },
@@ -165,7 +170,7 @@ def _parse_csv_rows(text: str) -> list[dict[str, str]]:
     header_index = next((i for i, line in enumerate(lines) if line.startswith("#HostName,")), None)
     if header_index is None:
         return []
-    reader = csv.DictReader(lines[header_index:], restval="")
+    reader = csv.DictReader(lines[header_index:])
     return list(reader)
 
 
@@ -173,9 +178,8 @@ def _find_row_in_api() -> dict[str, str] | None:
     for _ in range(5):
         try:
             text = _request(VPN_GATE_API, timeout=30).decode("utf-8", errors="replace")
-            rows = _parse_csv_rows(text)
             wanted = VPN_GATE_HOST.lower().rstrip(".")
-            for row in rows:
+            for row in _parse_csv_rows(text):
                 host = (row.get("HostName") or "").strip().lower().rstrip(".")
                 if host == wanted and (row.get("OpenVPN_ConfigData_Base64") or "").strip():
                     return row
@@ -185,78 +189,122 @@ def _find_row_in_api() -> dict[str, str] | None:
     return None
 
 
-def _find_do_openvpn_link() -> str | None:
-    """Fallback when the CSV API is blocked/empty: use the live VPN Gate server page."""
-    try:
-        ip = socket.gethostbyname(VPN_GATE_HOST)
-    except OSError:
-        ip = VPN_GATE_EXPECTED_IP
-
-    # VPN Gate exposes a do_openvpn.aspx page for individual servers. Its query
-    # parameters do not require the CSV API session ID; the page contains the
-    # current openvpn_download.aspx link including the required sid/hid values.
-    query = urllib.parse.urlencode({
-        "fqdn": VPN_GATE_HOST,
-        "ip": ip,
-        "tcp": str(VPN_GATE_TCP_PORT),
-        "udp": "0",
-    })
-    urls = [
-        f"https://www.vpngate.net/en/do_openvpn.aspx?{query}",
-        f"http://www.vpngate.net/en/do_openvpn.aspx?{query}",
+def _extract_server_do_link(page: str) -> str | None:
+    """Extract the exact do_openvpn.aspx link for our hostname from a VPN Gate listing page."""
+    wanted = VPN_GATE_HOST.lower()
+    page = html.unescape(page).replace("&amp;", "&")
+    patterns = [
+        r"(?:href|action)=[\"']([^\"']*do_openvpn\.aspx\?[^\"']*)[\"']",
+        r"(do_openvpn\.aspx\?[^\"'<>\s]+)",
     ]
-    for url in urls:
-        try:
-            page = _request(url, timeout=30).decode("utf-8", errors="replace")
-            # Prefer a TCP OpenVPN download link for the requested port.
-            for match in re.finditer(r"(?:href|action)=[\"']([^\"']*openvpn_download\.aspx[^\"']*)[\"']", page, flags=re.IGNORECASE):
-                href = html.unescape(match.group(1)).replace("&amp;", "&")
-                if "tcp=1" not in href.lower():
+    for pattern in patterns:
+        for match in re.finditer(pattern, page, flags=re.IGNORECASE):
+            href = match.group(1)
+            if "fqdn=" not in href.lower():
+                continue
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+            fqdn = urllib.parse.unquote(query.get("fqdn", [""])[0]).lower().rstrip(".")
+            if fqdn == wanted:
+                return href
+    return None
+
+
+def _build_openvpn_download_url(base: str, do_link: str) -> str | None:
+    """Build the documented common/openvpn_download.aspx URL from do_openvpn parameters."""
+    href = html.unescape(do_link).replace("&amp;", "&")
+    parsed = urllib.parse.urlparse(href)
+    params = urllib.parse.parse_qs(parsed.query)
+    ip = params.get("ip", [""])[0]
+    fqdn = params.get("fqdn", [""])[0]
+    tcp = params.get("tcp", ["0"])[0]
+    udp = params.get("udp", ["0"])[0]
+    sid = params.get("sid", [""])[0]
+    hid = params.get("hid", [""])[0]
+    if not sid or not hid or not (ip or fqdn):
+        return None
+
+    if tcp and tcp != "0":
+        transport = {"tcp": "1", "host": ip or fqdn, "port": tcp}
+        suffix = f"{ip or fqdn}_tcp_{tcp}.ovpn"
+    elif udp and udp != "0":
+        transport = {"udp": "1", "host": ip or fqdn, "port": udp}
+        suffix = f"{ip or fqdn}_udp_{udp}.ovpn"
+    else:
+        return None
+
+    query_items = [
+        ("sid", sid),
+        *transport.items(),
+        ("hid", hid),
+    ]
+    query = urllib.parse.urlencode(query_items)
+    return f"{base}/common/openvpn_download.aspx?{query}&/{urllib.parse.quote('vpngate_' + suffix)}"
+
+
+def _find_do_openvpn_link() -> tuple[str, str] | None:
+    """Get the current exact server link from the VPN Gate HTML listing, not a guessed URL."""
+    try:
+        current_ip = socket.gethostbyname(VPN_GATE_HOST)
+    except OSError:
+        current_ip = VPN_GATE_EXPECTED_IP
+
+    for base in VPN_GATE_MIRRORS:
+        for path in ("/en/", "/"):
+            url = f"{base}{path}"
+            try:
+                page = _request(url, timeout=45).decode("utf-8", errors="replace")
+                if VPN_GATE_HOST.lower() not in page.lower() and current_ip not in page:
                     continue
-                if "port=" in href.lower() and f"port={VPN_GATE_TCP_PORT}" not in href.lower():
+                do_link = _extract_server_do_link(page)
+                if not do_link:
                     continue
-                return urllib.parse.urljoin(url, href)
-        except Exception:
-            continue
+                absolute = urllib.parse.urljoin(url, do_link)
+                parsed = urllib.parse.urlparse(absolute)
+                params = urllib.parse.parse_qs(parsed.query)
+                tcp = params.get("tcp", ["0"])[0]
+                if tcp != str(VPN_GATE_TCP_PORT):
+                    continue
+                download = _build_openvpn_download_url(base, absolute)
+                if download:
+                    return absolute, download
+            except Exception:
+                continue
     return None
 
 
 def _download_profile_from_link(link: str) -> str:
     content = _request(link, timeout=60).decode("utf-8", errors="replace")
-    if "client" not in content.lower() or "<ca>" not in content.lower():
+    lowered = content.lower()
+    if "client" not in lowered or "<ca>" not in lowered:
         raise RuntimeError("VPN Gate returned an invalid OpenVPN profile.")
     return content
 
 
-def _vpngate_row() -> dict[str, str] | None:
+def _write_vpngate_profile(runtime_dir: Path) -> Path:
     row = _find_row_in_api()
+    config: str | None = None
+
     if row:
         live_ip = (row.get("IP") or "unknown").strip()
         if live_ip != VPN_GATE_EXPECTED_IP:
             print(f"VPN Gate server IP changed: screenshot={VPN_GATE_EXPECTED_IP}, live={live_ip}.", flush=True)
-        return row
-    return None
-
-
-def _write_vpngate_profile(runtime_dir: Path) -> Path:
-    row = _vpngate_row()
-    config: str | None = None
-
-    if row:
         try:
             config = base64.b64decode(row["OpenVPN_ConfigData_Base64"]).decode("utf-8")
         except Exception:
             config = None
 
     if config is None:
-        print("VPN Gate CSV API is unavailable; switching to direct server-page profile retrieval...", flush=True)
-        link = _find_do_openvpn_link()
-        if not link:
+        print("VPN Gate CSV API is unavailable; finding the exact server entry from the live VPN Gate HTML listing...", flush=True)
+        found = _find_do_openvpn_link()
+        if not found:
             raise RuntimeError(
-                f"VPN Gate could not provide an OpenVPN profile for {VPN_GATE_HOST}:{VPN_GATE_TCP_PORT}. "
-                "The server is visible in current VPN Gate listings, but its direct configuration page could not be retrieved."
+                f"VPN Gate could not locate the live OpenVPN entry for {VPN_GATE_HOST}:{VPN_GATE_TCP_PORT}. "
+                "The server is currently listed, but no matching configuration link was returned."
             )
-        config = _download_profile_from_link(link)
+        server_page, download_link = found
+        print(f"VPN Gate server entry found: {server_page}", flush=True)
+        print("Downloading the exact TCP OpenVPN profile for the requested server...", flush=True)
+        config = _download_profile_from_link(download_link)
 
     lines = []
     for line in config.splitlines():
