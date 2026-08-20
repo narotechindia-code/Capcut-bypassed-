@@ -1,12 +1,13 @@
 $ErrorActionPreference = 'Stop'
 $script:ExitCode = 0
+$LauncherVersion = '2.3.0'
+$CommitHint = '5478d6e'
 
 function Show-LauncherError {
     param([object]$ErrorRecord)
     Write-Host ''
     Write-Host '=== CapCut Launcher Error ===' -ForegroundColor Red
     Write-Host ($ErrorRecord.Exception.Message) -ForegroundColor Red
-    Write-Host ''
     Write-Host "Launcher log: $env:LOCALAPPDATA\CapCutBypassedLauncher\logs\launcher.log" -ForegroundColor Yellow
 }
 
@@ -18,12 +19,14 @@ function Pause-Launcher {
 
 try {
     Write-Host '=== CapCut Windows Launcher ===' -ForegroundColor Cyan
+    Write-Host "Version: $LauncherVersion ($CommitHint)" -ForegroundColor DarkGray
     Write-Host 'Mode: process-only VPN; Windows default routing is not intentionally changed.' -ForegroundColor DarkGray
 
     if ($env:OS -ne 'Windows_NT') { throw 'This launcher supports Windows only.' }
 
     $repo = 'narotechindia-code/Capcut-bypassed-'
     $rawBase = "https://raw.githubusercontent.com/$repo/main"
+    $cacheBust = "?v=$CommitHint"
     $installRoot = Join-Path $env:LOCALAPPDATA 'CapCutBypassedLauncher'
     $venv = Join-Path $installRoot '.venv'
     $selfFile = Join-Path $installRoot 'run.ps1'
@@ -70,13 +73,11 @@ try {
     foreach ($file in $files) {
         $target = Join-Path $installRoot $file
         New-Item -ItemType Directory -Force -Path (Split-Path $target) | Out-Null
-        Invoke-WebRequest -Uri "$rawBase/$file" -OutFile $target
+        Invoke-WebRequest -UseBasicParsing -Uri "$rawBase/$file$cacheBust" -OutFile $target
         if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { throw "Failed to download required file: $file" }
     }
-    # Always save a real script file. This is critical when the command was
-    # started as `irm ... | iex`, because $PSCommandPath is otherwise empty.
-    Invoke-WebRequest -Uri "$rawBase/scripts/run.ps1" -OutFile $selfFile
-    Write-Host '       Download complete.' -ForegroundColor Green
+    Invoke-WebRequest -UseBasicParsing -Uri "$rawBase/scripts/run.ps1$cacheBust" -OutFile $selfFile
+    Write-Host "       Download complete. Launcher version: $LauncherVersion" -ForegroundColor Green
 
     Write-Host '[3/5] Preparing isolated Python environment...' -ForegroundColor Cyan
     if (-not (Test-Path (Join-Path $venv 'Scripts/python.exe'))) {
@@ -88,8 +89,6 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Failed to prepare Python dependencies.' }
     Write-Host '       Python environment ready.' -ForegroundColor Green
 
-    # Elevate BEFORE Python starts. The elevated child is waited on, so there
-    # is no detached Python process that appears and then immediately closes.
     $needsAdmin = $true
     try {
         $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
