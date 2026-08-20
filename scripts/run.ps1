@@ -7,7 +7,7 @@ function Show-LauncherError {
     Write-Host '=== CapCut Launcher Error ===' -ForegroundColor Red
     Write-Host ($ErrorRecord.Exception.Message) -ForegroundColor Red
     Write-Host ''
-    Write-Host 'Launcher log: $env:LOCALAPPDATA\CapCutBypassedLauncher\logs\launcher.log' -ForegroundColor Yellow
+    Write-Host "Launcher log: $env:LOCALAPPDATA\CapCutBypassedLauncher\logs\launcher.log" -ForegroundColor Yellow
 }
 
 function Pause-Launcher {
@@ -26,6 +26,7 @@ try {
     $rawBase = "https://raw.githubusercontent.com/$repo/main"
     $installRoot = Join-Path $env:LOCALAPPDATA 'CapCutBypassedLauncher'
     $venv = Join-Path $installRoot '.venv'
+    $selfFile = Join-Path $installRoot 'run.ps1'
     New-Item -ItemType Directory -Force -Path $installRoot | Out-Null
 
     function Find-Python {
@@ -72,6 +73,9 @@ try {
         Invoke-WebRequest -Uri "$rawBase/$file" -OutFile $target
         if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { throw "Failed to download required file: $file" }
     }
+    # Always save a real script file. This is critical when the command was
+    # started as `irm ... | iex`, because $PSCommandPath is otherwise empty.
+    Invoke-WebRequest -Uri "$rawBase/scripts/run.ps1" -OutFile $selfFile
     Write-Host '       Download complete.' -ForegroundColor Green
 
     Write-Host '[3/5] Preparing isolated Python environment...' -ForegroundColor Cyan
@@ -84,9 +88,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Failed to prepare Python dependencies.' }
     Write-Host '       Python environment ready.' -ForegroundColor Green
 
-    # VPN mode needs elevation. Do it here, before starting Python, and WAIT for
-    # the elevated child. This prevents the old detached Python/UAC process from
-    # opening and immediately disappearing.
+    # Elevate BEFORE Python starts. The elevated child is waited on, so there
+    # is no detached Python process that appears and then immediately closes.
     $needsAdmin = $true
     try {
         $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -96,17 +99,14 @@ try {
 
     if ($needsAdmin) {
         Write-Host '[4/5] Requesting Administrator permission for process-only VPN...' -ForegroundColor Yellow
-        $ps1 = $PSCommandPath
-        if (-not $ps1) { throw 'The launcher script path could not be determined for elevation.' }
-        $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ps1)
+        $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $selfFile)
         $child = Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs -Wait -PassThru
         $script:ExitCode = $child.ExitCode
         Write-Host "Elevated launcher finished with exit code $script:ExitCode." -ForegroundColor Green
-        return
     }
-
-    Write-Host '[4/5] Starting launcher...' -ForegroundColor Cyan
-    $bootstrapCode = @"
+    else {
+        Write-Host '[4/5] Starting launcher...' -ForegroundColor Cyan
+        $bootstrapCode = @"
 import sys
 from pathlib import Path
 root = Path(r'''$installRoot''')
@@ -114,8 +114,9 @@ sys.path.insert(0, str(root))
 import launcher.main
 raise SystemExit(launcher.main.main())
 "@
-    & $venvPython -u -c $bootstrapCode @args
-    $script:ExitCode = $LASTEXITCODE
+        & $venvPython -u -c $bootstrapCode @args
+        $script:ExitCode = $LASTEXITCODE
+    }
 
     Write-Host '[5/5] Launcher finished.' -ForegroundColor Green
     if ($script:ExitCode -ne 0) { Write-Host "Launcher exit code: $script:ExitCode" -ForegroundColor Yellow }
@@ -128,4 +129,4 @@ finally {
     Pause-Launcher
 }
 
-# Deliberately no 'exit' so this remains safe when invoked through a PowerShell host.
+# Deliberately no 'exit': safe for interactive PowerShell and `irm ... | iex`.
