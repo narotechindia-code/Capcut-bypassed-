@@ -7,7 +7,13 @@ function Show-LauncherError {
     Write-Host '=== CapCut Launcher Error ===' -ForegroundColor Red
     Write-Host ($ErrorRecord.Exception.Message) -ForegroundColor Red
     Write-Host ''
-    Write-Host 'The PowerShell window will remain open so you can read the error.' -ForegroundColor Yellow
+    Write-Host 'Launcher log: $env:LOCALAPPDATA\CapCutBypassedLauncher\logs\launcher.log' -ForegroundColor Yellow
+}
+
+function Pause-Launcher {
+    Write-Host ''
+    Write-Host 'Press ENTER to close this launcher window...' -ForegroundColor Cyan
+    try { [void](Read-Host) } catch { Start-Sleep -Seconds 3 }
 }
 
 try {
@@ -78,6 +84,27 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Failed to prepare Python dependencies.' }
     Write-Host '       Python environment ready.' -ForegroundColor Green
 
+    # VPN mode needs elevation. Do it here, before starting Python, and WAIT for
+    # the elevated child. This prevents the old detached Python/UAC process from
+    # opening and immediately disappearing.
+    $needsAdmin = $true
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        $needsAdmin = -not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { $needsAdmin = $true }
+
+    if ($needsAdmin) {
+        Write-Host '[4/5] Requesting Administrator permission for process-only VPN...' -ForegroundColor Yellow
+        $ps1 = $PSCommandPath
+        if (-not $ps1) { throw 'The launcher script path could not be determined for elevation.' }
+        $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ps1)
+        $child = Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs -Wait -PassThru
+        $script:ExitCode = $child.ExitCode
+        Write-Host "Elevated launcher finished with exit code $script:ExitCode." -ForegroundColor Green
+        return
+    }
+
     Write-Host '[4/5] Starting launcher...' -ForegroundColor Cyan
     $bootstrapCode = @"
 import sys
@@ -87,7 +114,7 @@ sys.path.insert(0, str(root))
 import launcher.main
 raise SystemExit(launcher.main.main())
 "@
-    & $venvPython -c $bootstrapCode @args
+    & $venvPython -u -c $bootstrapCode @args
     $script:ExitCode = $LASTEXITCODE
 
     Write-Host '[5/5] Launcher finished.' -ForegroundColor Green
@@ -98,9 +125,7 @@ catch {
     Show-LauncherError $_
 }
 finally {
-    Write-Host ''
-    Write-Host 'Press ENTER to close this launcher window...' -ForegroundColor Cyan
-    try { [void](Read-Host) } catch {}
+    Pause-Launcher
 }
 
-# Do NOT use exit here. This script is commonly executed through "irm ... | iex".
+# Deliberately no 'exit' so this remains safe when invoked through a PowerShell host.
