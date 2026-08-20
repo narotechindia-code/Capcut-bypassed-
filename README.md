@@ -4,16 +4,16 @@ Windows launcher for running CapCut through a selected VPN path without intentio
 
 ## Network mode
 
-The default mode uses the **VPN Gate Vietnam server shown in the project configuration**:
+The default mode uses the **VPN Gate Vietnam server shown in the supplied configuration**:
 
 - Host: `vpn242832503.opengw.net`
-- IP: `42.112.191.8`
+- IP: `118.68.53.211`
 - OpenVPN TCP: `1653`
 - VPN Gate public credentials: username `vpn`, password `vpn`
 
 The launcher downloads the live OpenVPN profile at runtime so the server's certificates/keys are not hard-coded in this repository.
 
-The launcher uses the open-source `ENA526/OpenVPN-Split-Tunneling` helper for the process-only part. Its redirector uses WinDivert and sends selected applications through the OpenVPN adapter while leaving unselected applications on the normal Windows route. The helper requires administrator privileges. citehttps://github.com/ENA526/OpenVPN-Split-Tunneling
+The launcher uses the open-source `ENA526/OpenVPN-Split-Tunneling` helper for the process-only part. Its redirector uses WinDivert and sends selected applications through the OpenVPN adapter while leaving unselected applications on the normal Windows route.
 
 ## Important limitation
 
