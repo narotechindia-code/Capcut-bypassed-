@@ -20,6 +20,7 @@ VPN_GATE_USERNAME = "vpn"
 VPN_GATE_PASSWORD = "vpn"
 SPLIT_TUNNEL_REPO = "ENA526/OpenVPN-Split-Tunneling"
 SPLIT_TUNNEL_INSTALL_ROOT = Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "VpnClient"
+OPENVPN_WINGET_ID = "OpenVPNTechnologies.OpenVPN"
 
 
 @dataclass
@@ -44,7 +45,7 @@ def _run(args: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]
 
 
 def _download(url: str, destination: Path, timeout: int = 60) -> None:
-    req = urllib.request.Request(url, headers={"User-Agent": "CapCutBypassedLauncher/2.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "CapCutBypassedLauncher/2.1"})
     with urllib.request.urlopen(req, timeout=timeout) as response:
         data = response.read()
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -56,11 +57,66 @@ def find_openvpn() -> str | None:
         shutil.which("openvpn.exe"),
         str(Path(os.environ.get("PROGRAMFILES", "")) / "OpenVPN" / "bin" / "openvpn.exe"),
         str(Path(os.environ.get("PROGRAMFILES(X86)", "")) / "OpenVPN" / "bin" / "openvpn.exe"),
+        str(Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "OpenVPN" / "bin" / "openvpn.exe"),
     ]
     for candidate in candidates:
         if candidate and Path(candidate).is_file():
             return candidate
     return None
+
+
+def install_openvpn() -> str:
+    """Install the official OpenVPN Community package automatically when absent."""
+    existing = find_openvpn()
+    if existing:
+        return existing
+
+    winget = shutil.which("winget.exe") or shutil.which("winget")
+    if not winget:
+        raise RuntimeError(
+            "OpenVPN is not installed and WinGet is unavailable. "
+            "Install Microsoft App Installer/WinGet and run the launcher again."
+        )
+
+    print("OpenVPN Community is not installed. Installing it automatically...", flush=True)
+    result = _run(
+        [
+            winget,
+            "install",
+            "--id",
+            OPENVPN_WINGET_ID,
+            "--exact",
+            "--source",
+            "winget",
+            "--silent",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+            "--disable-interactivity",
+            "--scope",
+            "machine",
+        ],
+        timeout=900,
+    )
+    output = "\n".join(part for part in (result.stdout, result.stderr) if part).strip()
+    if result.returncode not in (0, 0x8A150014):
+        raise RuntimeError(
+            f"Automatic OpenVPN installation failed (WinGet exit code {result.returncode}).\n"
+            f"{output[-1800:]}"
+        )
+
+    # Windows does not always refresh PATH immediately after an MSI install.
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        found = find_openvpn()
+        if found:
+            print(f"OpenVPN installed: {found}", flush=True)
+            return found
+        time.sleep(2)
+
+    raise RuntimeError(
+        "OpenVPN installation completed, but openvpn.exe was not detected. "
+        "Please restart the launcher once so Windows can refresh the installation paths."
+    )
 
 
 def find_redirector() -> Path | None:
@@ -69,13 +125,13 @@ def find_redirector() -> Path | None:
 
 
 def install_split_tunnel_helper() -> Path:
-    """Install the external MIT split-tunnel helper used for process-only routing."""
+    """Install the external split-tunnel helper used for process-only routing."""
     redirector = find_redirector()
     if redirector:
         return redirector
 
     api_url = f"https://api.github.com/repos/{SPLIT_TUNNEL_REPO}/releases/latest"
-    req = urllib.request.Request(api_url, headers={"User-Agent": "CapCutBypassedLauncher/2.0"})
+    req = urllib.request.Request(api_url, headers={"User-Agent": "CapCutBypassedLauncher/2.1"})
     with urllib.request.urlopen(req, timeout=30) as response:
         release = json.loads(response.read().decode("utf-8"))
 
@@ -93,7 +149,7 @@ def install_split_tunnel_helper() -> Path:
         raise RuntimeError("Could not find the split-tunnel helper installer in its latest GitHub release.")
 
     temp = Path(tempfile.gettempdir()) / str(installer["name"])
-    print("Installing the process-only OpenVPN split-tunnel helper...")
+    print("Installing the process-only OpenVPN split-tunnel helper...", flush=True)
     _download(str(installer["browser_download_url"]), temp, timeout=180)
     result = _run([str(temp), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"], timeout=600)
     try:
@@ -104,17 +160,18 @@ def install_split_tunnel_helper() -> Path:
         detail = (result.stderr or result.stdout).strip()
         raise RuntimeError(f"Split-tunnel helper installation failed ({result.returncode}). {detail[-1200:]}")
 
-    deadline = time.time() + 60
+    deadline = time.time() + 90
     while time.time() < deadline:
         redirector = find_redirector()
         if redirector:
+            print(f"Split-tunnel helper installed: {redirector}", flush=True)
             return redirector
         time.sleep(2)
     raise RuntimeError("Split-tunnel helper installed, but redirector.exe was not found.")
 
 
 def _vpngate_row() -> dict[str, str]:
-    req = urllib.request.Request(VPN_GATE_API, headers={"User-Agent": "CapCutBypassedLauncher/2.0"})
+    req = urllib.request.Request(VPN_GATE_API, headers={"User-Agent": "CapCutBypassedLauncher/2.1"})
     with urllib.request.urlopen(req, timeout=30) as response:
         text = response.read().decode("utf-8", errors="replace")
 
@@ -128,7 +185,10 @@ def _vpngate_row() -> dict[str, str]:
         if host in {VPN_GATE_HOST, VPN_GATE_HOST.removesuffix(".opengw.net")} or ip == VPN_GATE_IP:
             if (row.get("OpenVPN_ConfigData_Base64") or "").strip():
                 return row
-    raise RuntimeError(f"The requested VPN Gate server {VPN_GATE_HOST} ({VPN_GATE_IP}) is not currently present in the live API list.")
+    raise RuntimeError(
+        f"The requested VPN Gate server {VPN_GATE_HOST} ({VPN_GATE_IP}) "
+        "is not currently present in the live API list."
+    )
 
 
 def _write_vpngate_profile(runtime_dir: Path) -> Path:
@@ -146,6 +206,9 @@ def _write_vpngate_profile(runtime_dir: Path) -> Path:
         if stripped.startswith("route ") and "0.0.0.0" in stripped:
             continue
         lines.append(line)
+
+    # OpenVPN 2.7 uses win-dco by default and removed the old Wintun selector.
+    # We therefore avoid forcing the obsolete "wintun" driver here.
     lines.extend([
         f"remote {VPN_GATE_HOST} {VPN_GATE_TCP_PORT}",
         "proto tcp-client",
@@ -179,30 +242,25 @@ def _write_split_config(capcut_exe: Path) -> Path:
     return config_path
 
 
-def _wait_for_vpn_adapter(timeout: float = 45.0) -> None:
+def _wait_for_vpn_adapter(timeout: float = 60.0) -> None:
     redirector = find_redirector()
     if redirector is None:
         raise RuntimeError("redirector.exe is unavailable.")
     deadline = time.time() + timeout
     while time.time() < deadline:
-        result = _run([str(redirector), "adapters"], timeout=15)
+        result = _run([str(redirector), "adapters"], timeout=20)
         output = f"{result.stdout}\n{result.stderr}"
         if "VPN adapter ready:" in output:
             return
         time.sleep(1)
-    raise RuntimeError("OpenVPN did not expose a usable VPN adapter within 45 seconds.")
+    raise RuntimeError("OpenVPN did not expose a usable VPN adapter within 60 seconds.")
 
 
 def start_split_vpn(capcut_exe: Path) -> SplitVpnSession:
+    # Fix for the failure shown in the screenshot: the previous version only
+    # installed the split-tunnel helper and assumed OpenVPN already existed.
+    openvpn = find_openvpn() or install_openvpn()
     redirector = install_split_tunnel_helper()
-    openvpn = find_openvpn()
-    if openvpn is None:
-        deadline = time.time() + 30
-        while time.time() < deadline and openvpn is None:
-            time.sleep(1)
-            openvpn = find_openvpn()
-    if openvpn is None:
-        raise RuntimeError("OpenVPN Community was not found after installing the split-tunnel helper.")
 
     runtime_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "CapCutBypassedLauncher" / "vpn"
     runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -225,12 +283,13 @@ def start_split_vpn(capcut_exe: Path) -> SplitVpnSession:
     )
     time.sleep(2)
 
+    # OpenVPN 2.7.x no longer accepts --windows-driver wintun; the default
+    # Windows DCO/TAP stack is selected by the installed client instead.
     openvpn_proc = subprocess.Popen(
         [
             openvpn,
             "--config", str(profile),
             "--auth-user-pass", str(auth_file),
-            "--windows-driver", "wintun",
             "--pull-filter", "ignore", "redirect-gateway",
             "--pull-filter", "ignore", "block-outside-dns",
             "--log", str(log_file),
@@ -246,10 +305,19 @@ def start_split_vpn(capcut_exe: Path) -> SplitVpnSession:
         _wait_for_vpn_adapter()
         time.sleep(2)
         if openvpn_proc.poll() is not None:
-            raise RuntimeError(f"OpenVPN exited unexpectedly with code {openvpn_proc.returncode}. See {log_file}")
+            log_tail = ""
+            try:
+                if log_file.is_file():
+                    log_tail = log_file.read_text(encoding="utf-8", errors="replace")[-3000:]
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"OpenVPN exited unexpectedly with code {openvpn_proc.returncode}.\n"
+                f"OpenVPN log: {log_file}\n{log_tail}"
+            )
         session.connected = True
-        print(f"VPN: {VPN_GATE_HOST}:{VPN_GATE_TCP_PORT} ({VPN_GATE_IP})")
-        print("Split tunnel: CapCut.exe only; Windows default routing is left unchanged.")
+        print(f"VPN: {VPN_GATE_HOST}:{VPN_GATE_TCP_PORT} ({VPN_GATE_IP})", flush=True)
+        print("Split tunnel: CapCut.exe only; Windows default routing is left unchanged.", flush=True)
         return session
     except Exception:
         stop_split_vpn(session)
