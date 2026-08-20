@@ -14,7 +14,7 @@ from pathlib import Path
 
 VPN_GATE_API = "https://www.vpngate.net/api/iphone/"
 VPN_GATE_HOST = "vpn242832503.opengw.net"
-VPN_GATE_IP = "42.112.191.8"
+VPN_GATE_IP = "118.68.53.211"
 VPN_GATE_TCP_PORT = 1653
 VPN_GATE_USERNAME = "vpn"
 VPN_GATE_PASSWORD = "vpn"
@@ -128,7 +128,7 @@ def _vpngate_row() -> dict[str, str]:
         if host in {VPN_GATE_HOST, VPN_GATE_HOST.removesuffix(".opengw.net")} or ip == VPN_GATE_IP:
             if (row.get("OpenVPN_ConfigData_Base64") or "").strip():
                 return row
-    raise RuntimeError(f"The requested VPN Gate server {VPN_GATE_HOST} is not currently present in the live API list.")
+    raise RuntimeError(f"The requested VPN Gate server {VPN_GATE_HOST} ({VPN_GATE_IP}) is not currently present in the live API list.")
 
 
 def _write_vpngate_profile(runtime_dir: Path) -> Path:
@@ -248,7 +248,7 @@ def start_split_vpn(capcut_exe: Path) -> SplitVpnSession:
         if openvpn_proc.poll() is not None:
             raise RuntimeError(f"OpenVPN exited unexpectedly with code {openvpn_proc.returncode}. See {log_file}")
         session.connected = True
-        print(f"VPN: {VPN_GATE_HOST}:{VPN_GATE_TCP_PORT} (VPN Gate)")
+        print(f"VPN: {VPN_GATE_HOST}:{VPN_GATE_TCP_PORT} ({VPN_GATE_IP})")
         print("Split tunnel: CapCut.exe only; Windows default routing is left unchanged.")
         return session
     except Exception:
